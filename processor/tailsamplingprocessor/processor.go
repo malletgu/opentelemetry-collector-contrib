@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"runtime"
 	"slices"
 	"sync/atomic"
@@ -452,8 +453,19 @@ type policyDecisionMetrics struct {
 
 type policyEvaluationMetrics struct {
 	idNotFoundOnMapCount, evaluateErrorCount, decisionSampled, decisionNotSampled, decisionDropped int64
-	tracesSampledByPolicyDecision                                                                  []map[samplingpolicy.Decision]policyDecisionMetrics
+	tracesSampledByPolicyDecision                                                                  []perPolicyDecisions
 	cumulativeExecutionTime                                                                        []perPolicyExecutionTime
+}
+
+// perPolicyDecisions accumulates sampled-stats per decision for one policy.
+// Decision is a small closed integer set, so a fixed array indexed by it
+// avoids allocating a map per policy on every tick (and per trace in
+// span-ingest mode).
+type perPolicyDecisions struct {
+	stats [samplingpolicy.NumDecisions]policyDecisionMetrics
+	// touched has one bit per decision recorded in stats, so metric
+	// recording only visits decisions that actually occurred.
+	touched uint64
 }
 
 // perPolicyExecutionTime is a struct for holding the cumulative execution time
@@ -465,22 +477,22 @@ type perPolicyExecutionTime struct {
 }
 
 func newPolicyEvaluationMetrics(numPolicies int) *policyEvaluationMetrics {
-	tracesSampledByPolicyDecision := make([]map[samplingpolicy.Decision]policyDecisionMetrics, numPolicies)
-	for i := range tracesSampledByPolicyDecision {
-		tracesSampledByPolicyDecision[i] = make(map[samplingpolicy.Decision]policyDecisionMetrics)
-	}
 	return &policyEvaluationMetrics{
-		tracesSampledByPolicyDecision: tracesSampledByPolicyDecision,
+		tracesSampledByPolicyDecision: make([]perPolicyDecisions, numPolicies),
 		cumulativeExecutionTime:       make([]perPolicyExecutionTime, numPolicies),
 	}
 }
 
 func (m *policyEvaluationMetrics) addDecision(policyIndex int, decision samplingpolicy.Decision, spansSampled, bytesSampled int64) {
-	stats := m.tracesSampledByPolicyDecision[policyIndex][decision]
+	if decision < 0 || decision >= samplingpolicy.NumDecisions {
+		return
+	}
+	perPolicy := &m.tracesSampledByPolicyDecision[policyIndex]
+	stats := &perPolicy.stats[decision]
 	stats.tracesSampled++
 	stats.spansSampled += spansSampled
 	stats.bytesSampled += bytesSampled
-	m.tracesSampledByPolicyDecision[policyIndex][decision] = stats
+	perPolicy.touched |= 1 << uint(decision)
 }
 
 func (m *policyEvaluationMetrics) addDecisionTime(policyIndex int, decisionTime time.Duration) {
@@ -492,13 +504,21 @@ func (m *policyEvaluationMetrics) addDecisionTime(policyIndex int, decisionTime 
 
 func (tsp *tailSamplingSpanProcessor) recordPerPolicyEvaluationMetrics(metrics *policyEvaluationMetrics) {
 	for i, p := range tsp.policies {
-		for decision, stats := range metrics.tracesSampledByPolicyDecision[i] {
-			tsp.telemetry.ProcessorTailSamplingCountTracesSampled.Add(tsp.ctx, int64(stats.tracesSampled), p.attribute, decisionToAttributes[decision])
+		perPolicy := &metrics.tracesSampledByPolicyDecision[i]
+		for touched := perPolicy.touched; touched != 0; {
+			decision := samplingpolicy.Decision(bits.TrailingZeros64(touched))
+			touched &= touched - 1
+			attrs, ok := decisionToAttributes[decision]
+			if !ok {
+				continue
+			}
+			stats := perPolicy.stats[decision]
+			tsp.telemetry.ProcessorTailSamplingCountTracesSampled.Add(tsp.ctx, int64(stats.tracesSampled), p.attribute, attrs)
 			if telemetry.IsMetricStatCountSpansSampledEnabled() {
-				tsp.telemetry.ProcessorTailSamplingCountSpansSampled.Add(tsp.ctx, stats.spansSampled, p.attribute, decisionToAttributes[decision])
+				tsp.telemetry.ProcessorTailSamplingCountSpansSampled.Add(tsp.ctx, stats.spansSampled, p.attribute, attrs)
 			}
 			if telemetry.IsMetricStatCountBytesSampledEnabled() {
-				tsp.telemetry.ProcessorTailSamplingCountBytesSampled.Add(tsp.ctx, stats.bytesSampled, p.attribute, decisionToAttributes[decision])
+				tsp.telemetry.ProcessorTailSamplingCountBytesSampled.Add(tsp.ctx, stats.bytesSampled, p.attribute, attrs)
 			}
 		}
 		tsp.telemetry.ProcessorTailSamplingSamplingPolicyExecutionTimeSum.Add(tsp.ctx, metrics.cumulativeExecutionTime[i].executionTime.Microseconds(), p.attribute)
@@ -1025,6 +1045,36 @@ func (tsp *tailSamplingSpanProcessor) makeDecisionOnSpanIngest(id pcommon.TraceI
 // dest scopes in first-seen order.
 func splitResourceSpansByTrace(rss ptrace.ResourceSpans) []traceBatch {
 	srcScopes := rss.ScopeSpans()
+
+	// Fast path: the common case is a single trace per ResourceSpans, when
+	// the whole ResourceSpans can be moved as-is instead of deep-copying the
+	// resource and scopes once per trace.
+	var firstID pcommon.TraceID
+	count := int64(0)
+	hasRoot := false
+	multiple := false
+outer:
+	for j := 0; j < srcScopes.Len(); j++ {
+		spans := srcScopes.At(j).Spans()
+		for k := 0; k < spans.Len(); k++ {
+			span := spans.At(k)
+			id := span.TraceID()
+			if count == 0 {
+				firstID = id
+			} else if id != firstID {
+				multiple = true
+				break outer
+			}
+			count++
+			if span.ParentSpanID().IsEmpty() {
+				hasRoot = true
+			}
+		}
+	}
+	if !multiple {
+		return []traceBatch{{id: firstID, hasRoot: hasRoot, rss: rss, spanCount: count}}
+	}
+
 	type builder struct {
 		rs        ptrace.ResourceSpans
 		destScope ptrace.ScopeSpans
